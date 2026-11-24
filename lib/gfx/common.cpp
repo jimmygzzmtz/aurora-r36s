@@ -1194,6 +1194,26 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
   return true;
 }
 
+bool efb_pass_holds(uint32_t minCommands) {
+  if (g_recordingFrame == nullptr || g_currentRenderPass == UINT32_MAX || g_inOffscreen) {
+    return false;
+  }
+  const auto& pass = current_render_passes()[g_currentRenderPass];
+  return pass.colorView == webgpu::g_frameBuffer.view && pass.commands.size() >= minCommands;
+}
+
+bool stream_efb_pass(uint32_t minCommands) {
+  if (!efb_pass_holds(minCommands)) {
+    return false;
+  }
+  // (as resolve_pass's pass break, without a snapshot)
+  auto& prevPass = current_render_passes()[g_currentRenderPass];
+  prevPass.discardable = !prevPass.has_consumer() && !prevPass.has_content();
+  enqueue_pass(current_frame_packet(), g_recordingFrameSlot, g_currentRenderPass);
+  resume_efb_pass_loading(prevPass);
+  return true;
+}
+
 static void resume_efb_pass_loading(const RenderPass& prevPass) {
   RenderPass newPass{
       .label = pass_label("EFB"),

@@ -110,6 +110,10 @@ std::vector<FifoSlot> sGxFree;
 bool sGxBusy = false;
 bool sGxStop = false;
 bool sGxFresh = true; // the next chunk starts a stream piece (after a drain): process() resets its caches
+// The EFB pass is handed to the render worker in pieces of this many commands while it is recorded
+// (gfx::stream_efb_pass), so it renders the frame alongside the game instead of after it.
+// $TTYD_PASS_STREAM=0: off; a number: the piece size.
+uint32_t sStreamCommands = 0;
 
 // $TTYD_TIMING_LOG: what the GX thread got and did, one [GX-THREAD] line per 60 drains
 struct GxStats {
@@ -143,6 +147,10 @@ void gx_thread_main() {
       sGxFresh = false;
     }
     process_chunk(chunk.data, chunk.size, fresh);
+    if (sStreamCommands != 0 && gfx::efb_pass_holds(sStreamCommands)) {
+      process_flush(); // (the pending batched draw belongs to the pass being handed over)
+      gfx::stream_efb_pass(sStreamCommands);
+    }
     if (gx_stats_on()) {
       sGxStats.chunks.fetch_add(1, std::memory_order_relaxed);
       sGxStats.bytes.fetch_add(chunk.size, std::memory_order_relaxed);
@@ -280,6 +288,10 @@ void init() {
   constexpr uint32_t initialCapacity = 512 * 1024;
   if (const char* want = std::getenv("TTYD_GX_THREAD"); want != nullptr && want[0] != '0') {
     sThreadedWanted = true;
+    sStreamCommands = 96;
+    if (const char* stream = std::getenv("TTYD_PASS_STREAM"); stream != nullptr) {
+      sStreamCommands = static_cast<uint32_t>(std::strtoul(stream, nullptr, 10));
+    }
   }
   {
     std::lock_guard<std::mutex> alock(sAsyncDrainMutex);

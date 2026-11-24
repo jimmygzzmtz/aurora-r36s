@@ -140,6 +140,12 @@ void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
 bool is_offscreen() noexcept;
 bool in_frame() noexcept;
+// The GX thread ($TTYD_GX_THREAD): once the EFB pass being recorded holds at least minCommands,
+// hand it to the render worker and go on in a continuation pass that loads its contents -- the
+// worker renders the frame while it is still being recorded, instead of all of it after the
+// frame ends. Returns whether it split. The caller flushes any draw it batches first.
+bool stream_efb_pass(uint32_t minCommands);
+bool efb_pass_holds(uint32_t minCommands);
 uint32_t get_sample_count() noexcept;
 void clear_caches() noexcept;
 

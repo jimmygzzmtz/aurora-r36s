@@ -499,6 +499,7 @@ void present_frame(uint32_t targetFbo) noexcept {
   // the caller composites the UI overlay + imgui, then swaps (desktop) or publishes the slot
   // (device). targetFbo is 0 (window default framebuffer) on desktop, or the acquired EFB slot's
   // worker FBO on the SDL2-shim device path.
+  gl::prof_frame();
   const auto& source = present_source();
   const uint32_t surfaceWidth = present_surface_width();
   const uint32_t surfaceHeight = present_surface_height();

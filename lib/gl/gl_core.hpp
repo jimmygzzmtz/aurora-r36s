@@ -341,6 +341,10 @@ struct GlProcTable {
   void (*GenTextures)(GLsizei, GLuint*) = nullptr;
   void (*DeleteTextures)(GLsizei, const GLuint*) = nullptr;
   GLboolean (*IsTexture)(GLuint) = nullptr; // optional: imgui font-texture liveness check
+  // Indexed draws with their index range (pass.cpp): on Mali the driver otherwise reads the index
+  // buffer on the CPU at every draw to find it.
+  void (*DrawRangeElements)(GLenum, GLuint, GLuint, GLsizei, GLenum, const void*) = nullptr;
+  void (*DrawRangeElementsBaseVertex)(GLenum, GLuint, GLuint, GLsizei, GLenum, const void*, GLint) = nullptr;
   void (*BindTexture)(GLenum, GLuint) = nullptr;
   void (*ActiveTexture)(GLenum) = nullptr;
   void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei) = nullptr;
@@ -498,6 +502,8 @@ void* resolve(ProcAddressFn getProc, const char* name);
 // is missing (optional ones -- debug/aniso/EGLImage -- may stay null). Must be
 // called with the owning context current on the calling thread.
 bool load(ProcAddressFn getProc);
+// $TTYD_TIMING_LOG: the per-frame GL call timing report (gl_loader.cpp), once per frame on the worker
+void prof_frame() noexcept;
 
 // True once load() has populated the required core set.
 bool loaded();

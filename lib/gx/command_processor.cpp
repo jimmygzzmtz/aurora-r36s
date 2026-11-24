@@ -791,6 +791,17 @@ struct DrainScopeTimer {
   }
 };
 
+void process_chunk(const u8* data, u32 size, bool fresh) {
+  ZoneScoped;
+  if (fresh) {
+    native_geom_cache_maybe_log_stats();
+    reset_frame_draw_cache();
+  }
+  process_stream(data, size, true, is_timing_enabled());
+}
+
+void process_flush() { flush_pending_pnmtx_batch(); }
+
 void process(const u8* data, u32 size, bool bigEndian) {
   ZoneScoped;
   native_geom_cache_maybe_log_stats();

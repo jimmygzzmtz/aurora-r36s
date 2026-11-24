@@ -314,6 +314,10 @@ void AuroraGetRenderSize(u32* width, u32* height);
  * Flush pending GX state and wait for FIFO processing without signaling a draw-done callback.
  */
 void AuroraGXSync(void);
+/* With the GX thread ($TTYD_GX_THREAD=1): hand the FIFO written so far to it once at least
+ * minBytes are waiting (0: whatever there is), so it translates while the game goes on. Call
+ * between GX calls (never inside GXBegin/GXEnd: refused there). Without the thread: nothing. */
+void AuroraGXKick(uint32_t minBytes);
 
 /**
  * Sets the actual render viewport in native framebuffer coordinates.

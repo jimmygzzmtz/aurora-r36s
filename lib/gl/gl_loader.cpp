@@ -2,6 +2,13 @@
 
 #include "../internal.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -77,6 +84,112 @@ void* resolve(ProcAddressFn getProc, const char* name) {
 }
 
 GlProcTable gl;
+
+// $TTYD_TIMING_LOG: each hot GL entry point wrapped with a timer, so the log says which calls the
+// driver spends the render worker's time in (the RK3326's Mali blob: most of it). One [GL-PROF]
+// line per 60 frames (prof_frame, from present_frame): the costliest calls, per frame.
+namespace prof {
+struct Stat {
+  const char* name = nullptr;
+  std::atomic<uint64_t> ns{0};
+  std::atomic<uint32_t> calls{0};
+};
+Stat g_stats[96];
+std::atomic<int> g_count{0};
+bool g_on = false;
+inline uint64_t now_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+} // namespace prof
+
+#define GLPROF(member)                                                                                      \
+  do {                                                                                                      \
+    using Fn = decltype(gl.member);                                                                         \
+    static Fn s_orig = nullptr;                                                                             \
+    static int s_idx = -1;                                                                                  \
+    if (gl.member == nullptr || s_idx >= 0) {                                                               \
+      break;                                                                                                \
+    }                                                                                                       \
+    s_idx = prof::g_count.fetch_add(1);                                                                     \
+    prof::g_stats[s_idx].name = #member;                                                                    \
+    s_orig = gl.member;                                                                                     \
+    gl.member = [](auto... args) {                                                                          \
+      const uint64_t t0 = prof::now_ns();                                                                   \
+      if constexpr (std::is_void_v<decltype(s_orig(args...))>) {                                             \
+        s_orig(args...);                                                                                    \
+        prof::g_stats[s_idx].ns.fetch_add(prof::now_ns() - t0, std::memory_order_relaxed);                  \
+        prof::g_stats[s_idx].calls.fetch_add(1, std::memory_order_relaxed);                                 \
+      } else {                                                                                              \
+        auto result = s_orig(args...);                                                                      \
+        prof::g_stats[s_idx].ns.fetch_add(prof::now_ns() - t0, std::memory_order_relaxed);                  \
+        prof::g_stats[s_idx].calls.fetch_add(1, std::memory_order_relaxed);                                 \
+        return result;                                                                                      \
+      }                                                                                                     \
+    };                                                                                                      \
+  } while (0)
+
+static void install_prof_wrappers() {
+  GLPROF(DrawElements);
+  GLPROF(DrawElementsBaseVertex);
+  GLPROF(DrawRangeElements);
+  GLPROF(DrawRangeElementsBaseVertex);
+  GLPROF(DrawArrays);
+  GLPROF(DrawElementsInstanced);
+  GLPROF(UseProgram);
+  GLPROF(BindTexture);
+  GLPROF(ActiveTexture);
+  GLPROF(BindSampler);
+  GLPROF(BindBufferRange);
+  GLPROF(BindBufferBase);
+  GLPROF(BindBuffer);
+  GLPROF(BufferSubData);
+  GLPROF(BufferData);
+  GLPROF(MapBufferRange);
+  GLPROF(UnmapBuffer);
+  GLPROF(FlushMappedBufferRange);
+  GLPROF(BindVertexArray);
+  GLPROF(VertexAttribPointer);
+  GLPROF(VertexAttribIPointer);
+  GLPROF(EnableVertexAttribArray);
+  GLPROF(DisableVertexAttribArray);
+  GLPROF(BindFramebuffer);
+  GLPROF(Enable);
+  GLPROF(Disable);
+  GLPROF(BlendFuncSeparate);
+  GLPROF(BlendEquationSeparate);
+  GLPROF(BlendColor);
+  GLPROF(ColorMask);
+  GLPROF(DepthMask);
+  GLPROF(DepthFunc);
+  GLPROF(CullFace);
+  GLPROF(FrontFace);
+  GLPROF(PolygonOffset);
+  GLPROF(Viewport);
+  GLPROF(Scissor);
+  GLPROF(StencilFuncSeparate);
+  GLPROF(Clear);
+  GLPROF(ClearBufferfv);
+  GLPROF(InvalidateFramebuffer);
+  GLPROF(TexSubImage2D);
+  GLPROF(TexImage2D);
+  GLPROF(TexStorage2D);
+  GLPROF(ClientWaitSync);
+  GLPROF(FenceSync);
+  GLPROF(BlitFramebuffer);
+  GLPROF(LineWidth);
+  GLPROF(Uniform1i);
+  GLPROF(DrawBuffers);
+  GLPROF(Flush);
+  GLPROF(GenerateMipmap);
+  GLPROF(CompressedTexSubImage2D);
+  GLPROF(TexParameteri);
+  GLPROF(SamplerParameteri);
+  prof::g_on = true;
+  Log.info("[gl] GL call timing on ($TTYD_TIMING_LOG): [GL-PROF] lines per 60 frames");
+}
+#undef GLPROF
 
 bool load(ProcAddressFn getProc) {
   bool missing = false;
@@ -230,6 +343,14 @@ bool load(ProcAddressFn getProc) {
   REQ(DrawElements, "glDrawElements")
   OPT(DrawArraysInstanced, "glDrawArraysInstanced")
   OPT(DrawElementsInstanced, "glDrawElementsInstanced")
+  OPT(DrawRangeElements, "glDrawRangeElements")
+  OPT(DrawRangeElementsBaseVertex, "glDrawRangeElementsBaseVertex")
+  if (gl.DrawRangeElementsBaseVertex == nullptr) {
+    OPT(DrawRangeElementsBaseVertex, "glDrawRangeElementsBaseVertexEXT")
+  }
+  if (gl.DrawRangeElementsBaseVertex == nullptr) {
+    OPT(DrawRangeElementsBaseVertex, "glDrawRangeElementsBaseVertexOES")
+  }
   OPT(DrawElementsBaseVertex, "glDrawElementsBaseVertex")
   if (gl.DrawElementsBaseVertex == nullptr) {
     OPT(DrawElementsBaseVertex, "glDrawElementsBaseVertexEXT")
@@ -290,6 +411,9 @@ bool load(ProcAddressFn getProc) {
 #undef REQ
 #undef OPT
 
+  if (std::getenv("TTYD_TIMING_LOG") != nullptr) {
+    install_prof_wrappers();
+  }
   g_loaded = !missing;
   if (missing) {
     Log.error("[gl] entry-point table incomplete; GL backend cannot initialize");
@@ -299,4 +423,39 @@ bool load(ProcAddressFn getProc) {
 
 bool loaded() { return g_loaded; }
 
+} // namespace aurora::gl
+
+namespace aurora::gl {
+void prof_frame() noexcept {
+  static int s_frames = 0;
+  if (!prof::g_on || ++s_frames < 60) {
+    return;
+  }
+  s_frames = 0;
+  struct Row {
+    const char* name;
+    double ms;
+    uint32_t calls;
+  };
+  Row rows[96];
+  int n = 0;
+  const int count = std::min(prof::g_count.load(), 96);
+  double total = 0;
+  for (int i = 0; i < count; ++i) {
+    const uint64_t ns = prof::g_stats[i].ns.exchange(0, std::memory_order_relaxed);
+    const uint32_t calls = prof::g_stats[i].calls.exchange(0, std::memory_order_relaxed);
+    if (calls != 0) {
+      rows[n++] = {prof::g_stats[i].name, ns / 1e6 / 60.0, calls / 60};
+      total += ns / 1e6 / 60.0;
+    }
+  }
+  std::sort(rows, rows + n, [](const Row& a, const Row& b) { return a.ms > b.ms; });
+  char line[1024];
+  int len = std::snprintf(line, sizeof(line), "[GL-PROF] per frame: %.2f ms in GL |", total);
+  for (int i = 0; i < n && i < 14 && len < static_cast<int>(sizeof(line)); ++i) {
+    len += std::snprintf(line + len, sizeof(line) - len, " %s %.2fms/%u", rows[i].name, rows[i].ms, rows[i].calls);
+  }
+  std::printf("%s\n", line);
+  std::fflush(stdout);
+}
 } // namespace aurora::gl

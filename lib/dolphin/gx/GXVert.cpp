@@ -6,9 +6,24 @@
 static u16 sBeginNVerts = 0;
 static u32 sBeginFifoSize = 0;
 static bool sInBegin = false;
+
 // GX_AUTO: offset of the u32 byte-length placeholder to patch in GXEnd
 static u32 sBeginSizeOffset = 0;
 static bool sBeginAuto = false;
+
+namespace aurora::gx::fifo {
+// The GX thread's kick (fifo.cpp) asks whether the FIFO can be handed over here. Only an open
+// GX_AUTO draw can't: its GXEnd patches the size by offset into this buffer. Any other open
+// GXBegin has all its vertices written by the time the game reaches a kick point (between GX
+// calls) -- the game simply never called GXEnd, an empty macro in the GameCube's release SDK,
+// which TTYD leaves out -- so it is closed here, and a late GXEnd won't measure across buffers.
+bool __gx_in_begin() noexcept {
+  if (sInBegin && !sBeginAuto) {
+    sInBegin = false;
+  }
+  return sInBegin;
+}
+} // namespace aurora::gx::fifo
 
 extern "C" {
 

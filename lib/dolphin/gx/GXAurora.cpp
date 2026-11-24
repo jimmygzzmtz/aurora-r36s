@@ -155,6 +155,7 @@ void AuroraGXSync(void) {
     aurora::gx::fifo::drain();
   }
 }
+void AuroraGXKick(uint32_t minBytes) { aurora::gx::fifo::kick_if_over(minBytes); }
 
 void GXSetDrawClassAurora(uint8_t drawClass) { (void)drawClass; }
 void GXSceneEndAurora(void) {}
@@ -270,6 +271,9 @@ void AuroraSetDrawsBlocking(bool blocking) {
 }
 
 void AuroraFlushTextureCaches(void) {
+  if (aurora::gx::fifo::threaded()) {
+    aurora::gx::fifo::drain(); // (the GX thread owns these caches while it runs)
+  }
   __gx_shadow_invalidate_tex();
   aurora::gx::clear_static_texture_cache();
   aurora::gx::clear_copy_texture_cache();

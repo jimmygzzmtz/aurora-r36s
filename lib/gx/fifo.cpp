@@ -1,15 +1,22 @@
 #include "fifo.hpp"
 #include "command_processor.hpp"
+#include "../gfx/common.hpp"
 #include "../internal.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
@@ -78,8 +85,202 @@ static void async_drain_worker() {
   }
 }
 
+// --- The GX thread ($TTYD_GX_THREAD=1) ---------------------------------------------------------
+// The game thread writes the FIFO as always; at command boundaries it hands the bytes written so
+// far to this thread (kick: the buffer goes to the queue, the writer takes a fresh one from a
+// pool) and goes on with the game while they are translated -- the GameCube's own model, where
+// the GPU reads the FIFO while the CPU runs on. The game already keeps what its draws read alive
+// until a draw sync (GXSetDrawSync -> AuroraGXSync) or the frame's end, and both drain(), which
+// here waits for this thread to finish everything handed to it. Every other path that touched
+// the command processor from the game thread drains first (create_pass, resolve_pass, custom
+// draws, the bounding box, the texture-cache flush), so the processor only ever runs on one
+// thread at a time. On the RK3326 this moved about 45% of the game thread's work in Rogueport
+// onto an idle core.
+bool __gx_in_begin() noexcept; // GXVert.cpp: inside GXBegin/GXEnd (a kick would split a draw)
+
+namespace {
+bool sThreadedWanted = false;
+std::thread sGxThread;
+std::thread::id sGxThreadId;
+std::mutex sGxMutex;
+std::condition_variable sGxWork; // the GX thread waits for a chunk
+std::condition_variable sGxIdle; // drain() waits for the GX thread
+std::deque<FifoSlot> sGxQueue;
+std::vector<FifoSlot> sGxFree;
+bool sGxBusy = false;
+bool sGxStop = false;
+bool sGxFresh = true; // the next chunk starts a stream piece (after a drain): process() resets its caches
+
+// $TTYD_TIMING_LOG: what the GX thread got and did, one [GX-THREAD] line per 60 drains
+struct GxStats {
+  std::atomic<uint32_t> kicks{0}, refusedBegin{0}, refusedFrame{0}, refusedEmpty{0}, chunks{0}, fresh{0};
+  std::atomic<uint64_t> bytes{0};
+  std::atomic<uint64_t> waitUs{0};
+  uint32_t syncs = 0;
+} sGxStats;
+bool gx_stats_on() {
+  static const bool on = std::getenv("TTYD_TIMING_LOG") != nullptr;
+  return on;
+}
+
+void gx_thread_main() {
+#if defined(__linux__)
+  pthread_setname_np(pthread_self(), "aurora-gx");
+#endif
+  for (;;) {
+    FifoSlot chunk;
+    bool fresh = false;
+    {
+      std::unique_lock lock(sGxMutex);
+      sGxWork.wait(lock, [] { return sGxStop || !sGxQueue.empty(); });
+      if (sGxQueue.empty()) {
+        return; // stopping, nothing left
+      }
+      chunk = sGxQueue.front();
+      sGxQueue.pop_front();
+      sGxBusy = true;
+      fresh = sGxFresh;
+      sGxFresh = false;
+    }
+    process_chunk(chunk.data, chunk.size, fresh);
+    if (gx_stats_on()) {
+      sGxStats.chunks.fetch_add(1, std::memory_order_relaxed);
+      sGxStats.bytes.fetch_add(chunk.size, std::memory_order_relaxed);
+      if (fresh) {
+        sGxStats.fresh.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    bool idle = false;
+    {
+      std::lock_guard lock(sGxMutex);
+      idle = sGxQueue.empty();
+    }
+    if (idle) {
+      process_flush(); // (the pending PnMtx batch submitted before anyone can see the processor idle)
+    }
+    {
+      std::lock_guard lock(sGxMutex);
+      chunk.size = 0;
+      sGxFree.push_back(chunk);
+      sGxBusy = false;
+    }
+    sGxIdle.notify_all();
+  }
+}
+
+bool on_gx_thread() { return sGxThread.joinable() && std::this_thread::get_id() == sGxThreadId; }
+} // namespace
+
+bool threaded() { return sThreadedWanted; }
+
+// (outside a frame the stream waits for the next one, as AuroraGXSync's drain does)
+// force (drain): hand over even inside an open GX_AUTO draw, as the single-threaded drain()
+// processed the buffer whatever state the writer was in.
+static bool kick_impl(bool force) {
+  if (!sThreadedWanted || on_gx_thread()) {
+    return false;
+  }
+  const bool inBegin = !force && __gx_in_begin();
+  if (detail::sBufferSize == 0 || inBegin || !gfx::in_frame()) {
+    if (gx_stats_on()) {
+      (detail::sBufferSize == 0 ? sGxStats.refusedEmpty : inBegin ? sGxStats.refusedBegin : sGxStats.refusedFrame)
+          .fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+  if (gx_stats_on()) {
+    sGxStats.kicks.fetch_add(1, std::memory_order_relaxed);
+  }
+  FifoSlot next{};
+  {
+    std::lock_guard lock(sGxMutex);
+    if (!sGxThread.joinable()) {
+      sGxStop = false;
+      sGxThread = std::thread(gx_thread_main);
+      sGxThreadId = sGxThread.get_id();
+      Log.info("GX thread started: the FIFO is translated beside the game");
+    }
+    sGxQueue.push_back(FifoSlot{detail::sBufferData, detail::sBufferSize, detail::sBufferCapacity});
+    if (!sGxFree.empty()) {
+      next = sGxFree.back();
+      sGxFree.pop_back();
+    }
+  }
+  sGxWork.notify_one();
+  if (next.data == nullptr) {
+    next.capacity = 256 * 1024;
+    next.data = static_cast<uint8_t*>(std::malloc(next.capacity));
+  }
+  detail::sBufferData = next.data;
+  detail::sBufferSize = 0;
+  detail::sBufferCapacity = next.capacity;
+  sSlots[sProducerSlot].data = next.data; // (write_data_grow keeps the slot in step with the buffer)
+  sSlots[sProducerSlot].capacity = next.capacity;
+  return true;
+}
+
+bool kick() { return kick_impl(false); }
+
+void kick_if_over(uint32_t bytes) {
+  if (detail::sBufferSize >= bytes) {
+    kick();
+  }
+}
+
+// The game thread: everything written so far translated, and the GX thread idle.
+static void gx_thread_sync() {
+  kick_impl(true);
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    std::unique_lock lock(sGxMutex);
+    sGxIdle.wait(lock, [] { return sGxQueue.empty() && !sGxBusy; });
+    sGxFresh = true;
+  }
+  if (gx_stats_on()) {
+    sGxStats.waitUs += static_cast<uint64_t>(
+        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    if (++sGxStats.syncs >= 60) {
+      std::printf("[GX-THREAD] 60 drains: %u kicks (refused: %u empty, %u in GXBegin, %u outside a frame), "
+                  "%u chunks (%u fresh), %.1f KB translated, drains waited %.2f ms each, buffer now %u B\n",
+                  sGxStats.kicks.exchange(0), sGxStats.refusedEmpty.exchange(0), sGxStats.refusedBegin.exchange(0),
+                  sGxStats.refusedFrame.exchange(0), sGxStats.chunks.exchange(0), sGxStats.fresh.exchange(0),
+                  sGxStats.bytes.exchange(0) / 1024.0, sGxStats.waitUs.exchange(0) / 60.0 / 1000.0,
+                  detail::sBufferSize);
+      std::fflush(stdout);
+      sGxStats.syncs = 0;
+    }
+  }
+}
+
+static void gx_thread_stop() {
+  std::thread thread;
+  {
+    std::lock_guard lock(sGxMutex);
+    sGxStop = true;
+    thread = std::move(sGxThread);
+  }
+  sGxWork.notify_all();
+  if (thread.joinable()) {
+    thread.join();
+  }
+  std::lock_guard lock(sGxMutex);
+  for (FifoSlot& s : sGxQueue) {
+    std::free(s.data);
+  }
+  for (FifoSlot& s : sGxFree) {
+    std::free(s.data);
+  }
+  sGxQueue.clear();
+  sGxFree.clear();
+  sGxBusy = false;
+  sGxFresh = true;
+}
+
 void init() {
   constexpr uint32_t initialCapacity = 512 * 1024;
+  if (const char* want = std::getenv("TTYD_GX_THREAD"); want != nullptr && want[0] != '0') {
+    sThreadedWanted = true;
+  }
   {
     std::lock_guard<std::mutex> alock(sAsyncDrainMutex);
     sAsyncDrainStop = false;
@@ -109,6 +310,10 @@ void init() {
 }
 
 void shutdown() {
+  if (sThreadedWanted) {
+    gx_thread_sync();
+    gx_thread_stop();
+  }
   std::thread threadToJoin;
   {
     std::lock_guard<std::mutex> lock(sAsyncDrainMutex);
@@ -221,6 +426,12 @@ uint32_t end_display_list() {
 bool in_display_list() { return detail::sInDisplayList; }
 
 void drain() {
+  if (sThreadedWanted) {
+    if (!on_gx_thread()) {
+      gx_thread_sync(); // (on the GX thread itself: the stream is already being processed in order)
+    }
+    return;
+  }
   if (!sDoubleBuffering.load(std::memory_order_acquire)) {
     drain_async_wait();
     if (detail::sBufferSize == 0) {

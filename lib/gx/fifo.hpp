@@ -88,8 +88,15 @@ void begin_display_list(uint8_t* buf, uint32_t size);
 uint32_t end_display_list();
 bool in_display_list();
 
-// Drain the internal FIFO buffer through the command processor
+// Drain the internal FIFO buffer through the command processor (with the GX thread: hand it
+// what is left and wait until it has translated everything)
 void drain();
+
+// The GX thread ($TTYD_GX_THREAD=1, fifo.cpp): hand the bytes written so far to it, at a command
+// boundary (refused inside GXBegin/GXEnd); kick_if_over only once that many bytes are waiting.
+bool threaded();
+bool kick();
+void kick_if_over(uint32_t bytes);
 
 // Async end-of-frame drain: swaps FIFO slots so the command processor can drain the
 // finished frame on a dedicated worker thread concurrently with presentation.

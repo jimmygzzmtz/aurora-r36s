@@ -77,6 +77,7 @@ private:
   bool m_hasPipeline = false;
   Buffer m_vertexBuffer{};
   uint64_t m_vertexOffset = 0;
+  uint64_t m_vertexSize = kWholeSize; // the bound vertex slice's bytes (DrawIndexed: the index range)
   Buffer m_indexBuffer{};
   IndexFormat m_indexFormat = IndexFormat::Uint16;
   uint64_t m_indexOffset = 0;

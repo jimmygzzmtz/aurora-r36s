@@ -307,9 +307,9 @@ void PassEncoder::SetBindGroup(uint32_t index, const BindingSet& set, size_t dyn
 
 void PassEncoder::SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset, uint64_t size) {
   (void)slot;
-  (void)size;
   m_vertexBuffer = buffer;
   m_vertexOffset = offset;
+  m_vertexSize = size;
 }
 
 void PassEncoder::SetIndexBuffer(const Buffer& buffer, IndexFormat format, uint64_t offset, uint64_t size) {
@@ -470,6 +470,7 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
 
   bool usedFallback = false;
   bool base0 = false;
+  GLuint rangeEnd = 0;
   bool eabBind = false;
   if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
     bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
@@ -487,11 +488,24 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
       }
       const GLint baseVert = m_vertexOffset == 0 ? 0 : static_cast<GLint>(m_vertexOffset / layout.stride);
       base0 = (baseVert == 0);
+      // The draw's indices address the bound vertex slice from its start (the base vertex), so
+      // they lie in [0, slice vertices - 1]: given to the driver, it doesn't scan the indices for
+      // their range on the CPU (the Mali blob did, at ~55 us a draw: most of the render worker's
+      // time in Rogueport). $TTYD_GL_NO_RANGE=1: the plain draws, as before.
+      static const bool s_noRange = std::getenv("TTYD_GL_NO_RANGE") != nullptr;
+      rangeEnd = 0;
+      if (!s_noRange && instanceCount <= 1 && m_vertexSize != kWholeSize && layout.stride > 0 &&
+          m_vertexSize >= layout.stride) {
+        rangeEnd = static_cast<GLuint>(m_vertexSize / layout.stride - 1);
+      }
       if (baseVert != 0) {
         const auto t1 = logDetail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (instanceCount > 1) {
           gl.DrawElementsInstancedBaseVertex(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
                                              static_cast<GLsizei>(instanceCount), baseVert);
+        } else if (rangeEnd != 0 && gl.DrawRangeElementsBaseVertex != nullptr) {
+          gl.DrawRangeElementsBaseVertex(mode, 0, rangeEnd, static_cast<GLsizei>(indexCount), idxType, idxPtr,
+                                         baseVert);
         } else {
           gl.DrawElementsBaseVertex(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr, baseVert);
         }
@@ -512,6 +526,8 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
   if (instanceCount > 1) {
     gl.DrawElementsInstanced(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
                              static_cast<GLsizei>(instanceCount));
+  } else if (base0 && !usedFallback && rangeEnd != 0 && gl.DrawRangeElements != nullptr) {
+    gl.DrawRangeElements(mode, 0, rangeEnd, static_cast<GLsizei>(indexCount), idxType, idxPtr);
   } else {
     gl.DrawElements(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr);
   }

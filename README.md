@@ -7,7 +7,7 @@
 > and similar), running through PortMaster. It builds on [jbcgames/aurora](https://github.com/jbcgames/aurora)'s
 > `rk3326-gles` branch (a native OpenGL ES 3.0 backend in place of Dawn), which builds on
 > [encounter/aurora](https://github.com/encounter/aurora). It powers the
-> [Paper Cut R36S port](https://github.com/jimmygzzmtz/paper-cut). The changes are in Aurora's GX and GL layers, not in
+> [Paper Cut R36S port](https://github.com/jimmygzzmtz/paper-cut-r36s). The changes are in Aurora's GX and GL layers, not in
 > any one game, so other Aurora-based GameCube ports on these devices can use them too.
 >
 > What this fork adds (branch `r36s`):

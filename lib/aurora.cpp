@@ -388,6 +388,13 @@ void aurora_flush_present() {
   aurora::webgpu::sdl2shim_present::flush_present();
 #endif
 }
+bool aurora_try_flush_present() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::webgpu::sdl2shim_present::try_flush_present();
+#else
+  return false;
+#endif
+}
 void aurora_set_double_buffering(bool enable) {
 #ifdef AURORA_ENABLE_GX
   aurora::gx::fifo::set_double_buffering(enable);

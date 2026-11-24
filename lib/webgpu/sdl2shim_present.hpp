@@ -56,6 +56,9 @@ void publish_empty();
 void note_frame_enqueued();
 // Present the frame the worker produced last: wait for it, blit it to the window, swap.
 void flush_present();
+// flush_present() only if the worker has already published a frame: never waits for the worker.
+// Returns true if a frame was presented.
+bool try_flush_present();
 // Drop any frame the worker is holding out to us without presenting it, and unblock a worker that
 // is waiting for a slot. Must run before any render_worker::synchronize() on the main thread.
 void recycle_pending();

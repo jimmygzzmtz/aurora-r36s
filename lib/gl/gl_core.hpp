@@ -340,6 +340,7 @@ struct GlProcTable {
   // Textures
   void (*GenTextures)(GLsizei, GLuint*) = nullptr;
   void (*DeleteTextures)(GLsizei, const GLuint*) = nullptr;
+  GLboolean (*IsTexture)(GLuint) = nullptr; // optional: imgui font-texture liveness check
   void (*BindTexture)(GLenum, GLuint) = nullptr;
   void (*ActiveTexture)(GLenum) = nullptr;
   void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei) = nullptr;

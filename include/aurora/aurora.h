@@ -132,6 +132,8 @@ const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();
 void aurora_flush_present();
+/** Presents the frame the render worker finished, if any, without waiting for one. */
+bool aurora_try_flush_present();
 
 void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);

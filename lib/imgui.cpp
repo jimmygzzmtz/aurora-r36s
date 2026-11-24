@@ -1,5 +1,6 @@
 #include "imgui.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cmath>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include "tracy/Tracy.hpp"
 
 namespace aurora::imgui {
+constexpr Module Log{"aurora::imgui"};
 static float g_scale;
 static std::string g_imguiSettings{};
 static std::string g_imguiLog{};
@@ -41,7 +43,62 @@ static std::vector<gl::Texture> g_glTextures;
 struct DrawData::Impl {
   ImDrawData drawData;
   std::vector<std::unique_ptr<ImDrawList>> drawLists;
+  gl::GLuint fontTexture = 0; // the atlas texture this frame's draw lists sample (GL path)
 };
+
+// What the GL font texture was last uploaded from. Paper Cut (and any game that adds fonts
+// after aurora_initialize) rebuilds the atlas itself -- AddFont + its own Build() + painting
+// custom glyphs into the RGBA32 pixels -- so the atlas is already "built" again by the next
+// new_frame, and an IsBuilt()-only check never re-uploads it: the GPU keeps the init-time,
+// default-font-only atlas while the draw lists use the new atlas' UVs. Compare the atlas'
+// identity instead and re-upload whenever it changed.
+struct AtlasStamp {
+  const void* pixels = nullptr;
+  int width = 0;
+  int height = 0;
+  int sources = 0;
+  int customRects = 0;
+  bool operator==(const AtlasStamp&) const = default;
+};
+static AtlasStamp g_uploadedAtlas{};
+// Set on the render worker when the font texture's GL name no longer names a texture (deleted
+// under imgui: it then samples as an incomplete texture, opaque black -- every glyph a black
+// box). The main thread re-uploads at its next new_frame, where touching the atlas is safe.
+static std::atomic_bool g_fontTextureLost{false};
+
+static AtlasStamp atlas_stamp() {
+  const ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+  return {
+      .pixels = atlas->TexPixelsRGBA32 != nullptr ? static_cast<const void*>(atlas->TexPixelsRGBA32)
+                                                  : static_cast<const void*>(atlas->TexPixelsAlpha8),
+      .width = atlas->TexWidth,
+      .height = atlas->TexHeight,
+      .sources = atlas->Sources.Size,
+      .customRects = atlas->CustomRects.Size,
+  };
+}
+
+// Render worker (GL context current): (re)create imgui's font texture from the current atlas.
+static void upload_fonts_texture_on_worker() {
+  gfx::render_worker::enqueue_work([] {
+    while (gl::gl.GetError() != gl::GL_NO_ERROR) {
+    }
+    ImGui_ImplOpenGL3_DestroyFontsTexture();
+    ImGui_ImplOpenGL3_CreateFontsTexture();
+    const gl::GLenum err = gl::gl.GetError();
+    const ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    if (err != gl::GL_NO_ERROR) {
+      Log.error("font atlas upload failed: {}x{} (GL 0x{:x}); imgui text will draw as black boxes", atlas->TexWidth,
+                atlas->TexHeight, err);
+    } else {
+      Log.info("font atlas uploaded: {}x{} RGBA ({} KiB), texture {}", atlas->TexWidth, atlas->TexHeight,
+               atlas->TexWidth * atlas->TexHeight * 4 / 1024, static_cast<uint64_t>(atlas->TexID));
+    }
+    gl::invalidate_texture_bindings();
+  });
+  gfx::render_worker::synchronize();
+  g_uploadedAtlas = atlas_stamp();
+}
 
 void create_context() noexcept {
   IMGUI_CHECKVERSION();
@@ -71,6 +128,7 @@ void initialize() noexcept {
       gl::invalidate_texture_bindings();
     });
     gfx::render_worker::synchronize();
+    g_uploadedAtlas = atlas_stamp();
   }
 }
 
@@ -162,13 +220,16 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     // resizes 320x320 -> 304x224). The old Dawn path rebuilt here too. The rebuild issues GL, so it
     // must run where the render context is current -- the render worker (the main thread has no GL
     // context on desktop, and only the shim's present context on device), same as init above.
-    if ((g_scale > 0.f && g_scale != size.scale) || !ImGui::GetIO().Fonts->IsBuilt()) {
-      gfx::render_worker::enqueue_work([] {
-        ImGui_ImplOpenGL3_DestroyFontsTexture();
-        ImGui_ImplOpenGL3_CreateFontsTexture();
-        gl::invalidate_texture_bindings();
-      });
-      gfx::render_worker::synchronize();
+    //
+    // Also re-upload when the atlas changed without becoming unbuilt (see AtlasStamp), and when
+    // the render worker found the texture gone (g_fontTextureLost).
+    const bool lost = g_fontTextureLost.exchange(false, std::memory_order_acq_rel);
+    if ((g_scale > 0.f && g_scale != size.scale) || !ImGui::GetIO().Fonts->IsBuilt() ||
+        atlas_stamp() != g_uploadedAtlas || lost) {
+      if (lost) {
+        Log.warn("font texture was deleted under imgui; re-uploading the atlas");
+      }
+      upload_fonts_texture_on_worker();
     }
     g_scale = size.scale;
     ImGui_ImplOpenGL3_NewFrame();
@@ -189,6 +250,7 @@ DrawData freeze() noexcept {
   data->FramebufferScale = ImGui::GetIO().DisplayFramebufferScale;
   auto frozen = std::make_shared<DrawData::Impl>();
   frozen->drawData = *data;
+  frozen->fontTexture = static_cast<gl::GLuint>(ImGui::GetIO().Fonts->TexID);
   frozen->drawLists.reserve(data->CmdListsCount);
   frozen->drawData.CmdLists.resize(data->CmdListsCount);
   for (int i = 0; i < data->CmdListsCount; ++i) {
@@ -218,6 +280,11 @@ void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept {
     // window's default framebuffer, on top of the presented scene + RmlUi overlay).
     // ImGui_ImplOpenGL3_RenderDrawData sets its own viewport/program/blend from the draw data.
     gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, pass.target().fbo);
+    const gl::GLuint fontTexture = drawData.m_impl->fontTexture;
+    if (fontTexture != 0 && gl::gl.IsTexture != nullptr && gl::gl.IsTexture(fontTexture) == 0) {
+      // Only flag it here: the atlas belongs to the main thread, which may be mid-frame.
+      g_fontTextureLost.store(true, std::memory_order_release);
+    }
     ImGui_ImplOpenGL3_RenderDrawData(data);
     // imgui restored raw GL it does not track; drop the state-cache shadow.
     gl::reset_state_cache();

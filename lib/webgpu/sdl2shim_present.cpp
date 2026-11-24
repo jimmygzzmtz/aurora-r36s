@@ -1,5 +1,6 @@
 #include "sdl2shim_present.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -283,9 +284,31 @@ void blit_and_swap(Slot& slot) {
   int drawableHeight = static_cast<int>(g_height);
   SDL_GetWindowSizeInPixels(window, &drawableWidth, &drawableHeight);
 
-  // Wait for the worker to finish compositing this slot on GPU (server-side wait
-  // so main CPU continues overlapping game work instead of stalling on the GPU).
-  if (slot.fwdSync != nullptr) {
+  // $TTYD_TIMING_LOG: where the main thread's blocked time in here goes. The GPU's part is measured
+  // with a CPU wait on the worker's fence (the frame's GPU work done), the swap's part (SDL2 KMSDRM:
+  // page flip, vblank) around the swap call. One [SWAP] line per 30 presents.
+  static const bool s_timeSwap = std::getenv("TTYD_TIMING_LOG") != nullptr;
+  static double s_gpuSum, s_gpuMax, s_swapSum, s_swapMax, s_blitSum;
+  static int s_swapCount;
+  using SwapClock = std::chrono::steady_clock;
+  const auto ms_since = [](SwapClock::time_point t) {
+    return std::chrono::duration<double, std::milli>(SwapClock::now() - t).count();
+  };
+  // The worker's frame must be finished on the GPU before the blit reads it. A CPU wait on its
+  // fence: on device it has usually signalled already (measured ~0 ms in Rogueport), while the
+  // server-side eglWaitSyncKHR this used before left the swap itself blocking ~12 ms a frame
+  // on the Mali blob. The server wait stays as the fallback without eglClientWaitSyncKHR.
+  const auto tGpu = SwapClock::now();
+  bool gpuWaited = false;
+  if (slot.fwdSync != nullptr && gl::gl.eglClientWaitSyncKHR != nullptr) {
+    gl::gl.eglClientWaitSyncKHR(g_display, slot.fwdSync, 1u /* EGL_SYNC_FLUSH_COMMANDS_BIT_KHR */,
+                                RevSyncWaitTimeoutNs);
+    gpuWaited = true;
+  }
+  const double gpuMs = ms_since(tGpu);
+  const auto tBlit = SwapClock::now();
+
+  if (slot.fwdSync != nullptr && !gpuWaited) {
     if (gl::gl.eglWaitSyncKHR != nullptr) {
       gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
     } else if (gl::gl.eglClientWaitSyncKHR != nullptr) {
@@ -371,10 +394,27 @@ void blit_and_swap(Slot& slot) {
     }
   }
 
+  const double blitMs = ms_since(tBlit);
+  const auto tSwap = SwapClock::now();
   if (g_sdl2SwapWindow != nullptr && g_sdl2Window != nullptr) {
     g_sdl2SwapWindow(g_sdl2Window);
   } else {
     SDL_GL_SwapWindow(window);
+  }
+  if (s_timeSwap) {
+    const double swapMs = ms_since(tSwap);
+    s_gpuSum += gpuMs;
+    s_gpuMax = std::max(s_gpuMax, gpuMs);
+    s_swapSum += swapMs;
+    s_swapMax = std::max(s_swapMax, swapMs);
+    s_blitSum += blitMs;
+    if (++s_swapCount == 30) {
+      std::fprintf(stdout, "[SWAP] 30 presents: gpu_wait avg %.1f max %.1f ms | blit avg %.1f ms | swap avg %.1f max %.1f ms\n",
+                   s_gpuSum / 30, s_gpuMax, s_blitSum / 30, s_swapSum / 30, s_swapMax);
+      std::fflush(stdout);
+      s_gpuSum = s_gpuMax = s_swapSum = s_swapMax = s_blitSum = 0;
+      s_swapCount = 0;
+    }
   }
 }
 
@@ -701,6 +741,20 @@ void flush_present() {
                    msTotal, msWait, static_cast<unsigned long long>(wt.frameId), wt.gapBeforeBeginMs, wt.fbWaitMs, wt.opsUploadMs, wt.opsRenderMs, wt.endQWaitMs, wt.preCbMs, wt.endCbMs, g_lastRevSyncMs, wt.endFenceMs, wt.postCbMs, wt.opCount, wt.drawCount, msFwd, msSwap, msPost);
     }
   }
+}
+
+bool try_flush_present() {
+  if (!g_active) {
+    return false;
+  }
+  {
+    std::lock_guard lock{g_mutex};
+    if (!g_hasReadyFrame) {
+      return false; // still compositing: the next end_frame's flush_present shows it
+    }
+  }
+  flush_present(); // only the main thread consumes, so the frame is still there
+  return true;
 }
 
 void recycle_pending() {

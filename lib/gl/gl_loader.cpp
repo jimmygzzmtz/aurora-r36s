@@ -122,6 +122,7 @@ bool load(ProcAddressFn getProc) {
   // Textures
   REQ(GenTextures, "glGenTextures")
   REQ(DeleteTextures, "glDeleteTextures")
+  OPT(IsTexture, "glIsTexture")
   REQ(BindTexture, "glBindTexture")
   REQ(ActiveTexture, "glActiveTexture")
   REQ(TexStorage2D, "glTexStorage2D")

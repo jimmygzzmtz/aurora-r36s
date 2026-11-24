@@ -3,6 +3,26 @@
 </div>
 <br/>
 
+> **aurora-r36s** is a fork for ARM Linux handhelds with a Rockchip RK3326 and a Mali-G31 GPU (the R36S
+> and similar), running through PortMaster. It builds on [jbcgames/aurora](https://github.com/jbcgames/aurora)'s
+> `rk3326-gles` branch (a native OpenGL ES 3.0 backend in place of Dawn), which builds on
+> [encounter/aurora](https://github.com/encounter/aurora). It powers the
+> [Paper Cut R36S port](https://github.com/jimmygzzmtz/paper-cut). The changes are in Aurora's GX and GL layers, not in
+> any one game, so other Aurora-based GameCube ports on these devices can use them too.
+>
+> What this fork adds (branch `r36s`):
+> - **GX thread** (`TTYD_GX_THREAD=1`): GX FIFO translation runs on its own core while the game runs, as the
+>   GameCube's GPU read the FIFO. Games hand it work with `AuroraGXKick()`; every existing sync point waits for it.
+> - **Streamed render passes**: with the GX thread, the EFB pass goes to the render worker in pieces while it is being
+>   recorded, so a frame is drawn alongside the game instead of after it (`TTYD_PASS_STREAM`).
+> - **Mali draw cost**: indexed draws pass their index range (`glDrawRangeElements*`), so the Mali driver stops reading
+>   every draw's indices on the CPU (`TTYD_GL_NO_RANGE=1` to compare).
+> - **Readable Dear ImGui text**: the font atlas is re-uploaded whenever it changes (glyphs drew as black boxes).
+> - **Present on the frame tick** (`aurora_try_flush_present`) and a CPU fence wait before the swap.
+> - **Measuring**: `TTYD_TIMING_LOG=1` prints per-frame GL call costs (`[GL-PROF]`), GX thread statistics
+>   (`[GX-THREAD]`) and swap timing (`[SWAP]`).
+> - The SDL3-over-SDL2 shim location is the `AURORA_SDL3_SHIM_DIR` CMake option.
+
 Aurora is a source-level GameCube & Wii compatibility layer intended for use with game decompilation projects.
 
 Originally developed for use in [Metaforce](https://github.com/AxioDL/metaforce), a Metroid Prime reverse engineering project.
